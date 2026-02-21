@@ -28,17 +28,17 @@ const morgan = require('morgan');
 const POOLS = {
   user: {
     targets: [
-      { host: 'user_management_service', port: 8001 },
-      { host: 'user_management_service', port: 8001 },
-      { host: 'user_management_service', port: 8001 },
+      { host: 'user_management_service_1', port: 8001 },
+      { host: 'user_management_service_2', port: 8001 },
+      { host: 'user_management_service_3', port: 8001 },
     ],
     counter: 0,
   },
   enterprise: {
     targets: [
-      { host: 'enterprise_management_service', port: 8002 },
-      { host: 'enterprise_management_service', port: 8002 },
-      { host: 'enterprise_management_service', port: 8002 },
+      { host: 'enterprise_management_service_1', port: 8002 },
+      { host: 'enterprise_management_service_2', port: 8002 },
+      { host: 'enterprise_management_service_3', port: 8002 },
     ],
     counter: 0,
   },
@@ -122,6 +122,6 @@ const server = http.createServer(app);
 
 server.listen(PORT, () => {
   console.log(`[gateway] listening on port ${PORT}`);
-  console.log(`[gateway] user pool        → ${POOLS.user.targets.length} replica(s) at user_management_service:8001`);
-  console.log(`[gateway] enterprise pool  → ${POOLS.enterprise.targets.length} replica(s) at enterprise_management_service:8002`);
+  console.log(`[gateway] user pool        → ${POOLS.user.targets.map(t => t.host).join(', ')}`);
+  console.log(`[gateway] enterprise pool  → ${POOLS.enterprise.targets.map(t => t.host).join(', ')}`);
 });

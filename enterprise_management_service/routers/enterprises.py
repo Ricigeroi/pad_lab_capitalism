@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+import os, socket
 
 from core.dependencies import get_db, get_current_user_id
 from core.user_client import fetch_user, fetch_users
@@ -20,8 +21,21 @@ from schemas.enterprise import (
 
 router = APIRouter(tags=["Enterprises"])
 
+_REPLICA_ID = os.getenv("REPLICA_ID", "unknown")
+_HOSTNAME   = socket.gethostname()
 
-# ── POST /enterprise/create ───────────────────────────────────────────────────
+
+# ── GET /enterprise/whoami  (MUST be before /{enterprise_id}) ─────────────────
+@router.get("/enterprise/whoami", tags=["Health"])
+async def whoami():
+    """Returns the identity of this specific replica – use it to verify round-robin."""
+    return {
+        "service":    "enterprise_management_service",
+        "replica_id": _REPLICA_ID,
+        "hostname":   _HOSTNAME,
+    }
+
+
 
 @router.post(
     "/enterprise/create",

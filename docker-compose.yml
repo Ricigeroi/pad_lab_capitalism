@@ -38,47 +38,121 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── User Management Service (3 replicas) ────────────────────────────────────
-  user_management_service:
+  # ── User Management Service — 3 named replicas ──────────────────────────────
+  user_management_service_1:
     build:
       context: ./user_management_service
       dockerfile: Dockerfile
+    container_name: user_management_service_1
+    hostname: user_management_service_1
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+asyncpg://capitalism_user:capitalism_pass@postgres_user_mgmt:5432/user_management_db
       SECRET_KEY: changeme_use_a_long_random_string_in_production
       ALGORITHM: HS256
       ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+      REPLICA_ID: "user-1"
     expose:
       - "8001"
     depends_on:
       postgres_user_mgmt:
         condition: service_healthy
-    deploy:
-      replicas: 3
-      restart_policy:
-        condition: on-failure
 
-  # ── Enterprise Management Service (3 replicas) ──────────────────────────────
-  enterprise_management_service:
+  user_management_service_2:
+    build:
+      context: ./user_management_service
+      dockerfile: Dockerfile
+    container_name: user_management_service_2
+    hostname: user_management_service_2
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://capitalism_user:capitalism_pass@postgres_user_mgmt:5432/user_management_db
+      SECRET_KEY: changeme_use_a_long_random_string_in_production
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+      REPLICA_ID: "user-2"
+    expose:
+      - "8001"
+    depends_on:
+      postgres_user_mgmt:
+        condition: service_healthy
+
+  user_management_service_3:
+    build:
+      context: ./user_management_service
+      dockerfile: Dockerfile
+    container_name: user_management_service_3
+    hostname: user_management_service_3
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://capitalism_user:capitalism_pass@postgres_user_mgmt:5432/user_management_db
+      SECRET_KEY: changeme_use_a_long_random_string_in_production
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+      REPLICA_ID: "user-3"
+    expose:
+      - "8001"
+    depends_on:
+      postgres_user_mgmt:
+        condition: service_healthy
+
+  # ── Enterprise Management Service — 3 named replicas ────────────────────────
+  enterprise_management_service_1:
     build:
       context: ./enterprise_management_service
       dockerfile: Dockerfile
+    container_name: enterprise_management_service_1
+    hostname: enterprise_management_service_1
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+asyncpg://capitalism_user:capitalism_pass@postgres_enterprise:5432/enterprise_management_db
       SECRET_KEY: changeme_use_a_long_random_string_in_production
       ALGORITHM: HS256
-      USER_SERVICE_URL: http://user_management_service:8001
+      USER_SERVICE_URL: http://user_management_service_1:8001
+      REPLICA_ID: "enterprise-1"
     expose:
       - "8002"
     depends_on:
       postgres_enterprise:
         condition: service_healthy
-    deploy:
-      replicas: 3
-      restart_policy:
-        condition: on-failure
+
+  enterprise_management_service_2:
+    build:
+      context: ./enterprise_management_service
+      dockerfile: Dockerfile
+    container_name: enterprise_management_service_2
+    hostname: enterprise_management_service_2
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://capitalism_user:capitalism_pass@postgres_enterprise:5432/enterprise_management_db
+      SECRET_KEY: changeme_use_a_long_random_string_in_production
+      ALGORITHM: HS256
+      USER_SERVICE_URL: http://user_management_service_1:8001
+      REPLICA_ID: "enterprise-2"
+    expose:
+      - "8002"
+    depends_on:
+      postgres_enterprise:
+        condition: service_healthy
+
+  enterprise_management_service_3:
+    build:
+      context: ./enterprise_management_service
+      dockerfile: Dockerfile
+    container_name: enterprise_management_service_3
+    hostname: enterprise_management_service_3
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://capitalism_user:capitalism_pass@postgres_enterprise:5432/enterprise_management_db
+      SECRET_KEY: changeme_use_a_long_random_string_in_production
+      ALGORITHM: HS256
+      USER_SERVICE_URL: http://user_management_service_1:8001
+      REPLICA_ID: "enterprise-3"
+    expose:
+      - "8002"
+    depends_on:
+      postgres_enterprise:
+        condition: service_healthy
 
   # ── API Gateway ──────────────────────────────────────────────────────────────
   gateway:
@@ -90,10 +164,14 @@ services:
     environment:
       PORT: "8000"
     ports:
-      - "8000:8000"   # single public entry-point
+      - "8000:8000"
     depends_on:
-      - user_management_service
-      - enterprise_management_service
+      - user_management_service_1
+      - user_management_service_2
+      - user_management_service_3
+      - enterprise_management_service_1
+      - enterprise_management_service_2
+      - enterprise_management_service_3
 
   # ── pgAdmin ──────────────────────────────────────────────────────────────────
   pgadmin:
