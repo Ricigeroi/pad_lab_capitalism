@@ -133,10 +133,24 @@ app.get('/status', (_req, res) => {
 });
 
 // ── Cache middleware (GET only) ───────────────────────────────────────────────
+
+// Paths that must NEVER be cached – they exist specifically to show live,
+// per-replica data, so caching them would defeat their purpose entirely.
+const NO_CACHE_SUFFIXES = ['/whoami', '/status'];
+
 async function cacheMiddleware(req, res, next) {
   // Never cache non-GET requests (mutations must always hit upstream)
   if (req.method !== 'GET') {
     cacheStats.bypassed++;
+    return next();
+  }
+
+  // Never cache health / identity endpoints
+  const path = req.originalUrl.split('?')[0]; // strip query string for matching
+  const isNoCachePath = NO_CACHE_SUFFIXES.some(suffix => path.endsWith(suffix));
+  if (isNoCachePath) {
+    cacheStats.bypassed++;
+    console.log(`[cache] BYPASS (no-cache path) ${req.originalUrl}`);
     return next();
   }
 
