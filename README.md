@@ -17,8 +17,9 @@ Players register, manage enterprises (factories, research labs, transport system
 8. [pgAdmin — Querying the Databases](#8-pgadmin--querying-the-databases)
 9. [How the API Gateway Works](#9-how-the-api-gateway-works)
 10. [How Redis Caching Works](#10-how-redis-caching-works)
-11. [Complete Demo Walk-through](#11-complete-demo-walk-through)
-12. [Proving Round-Robin & Cache in Action](#12-proving-round-robin--cache-in-action)
+11. [Fault Tolerance & Circuit Breaker](#11-fault-tolerance--circuit-breaker)
+12. [Complete Demo Walk-through](#12-complete-demo-walk-through)
+13. [Proving Round-Robin, Cache & Fault Tolerance in Postman](#13-proving-round-robin-cache--fault-tolerance-in-postman)
 
 ---
 
@@ -217,10 +218,23 @@ curl http://localhost:8000/status
 {
   "status": "ok",
   "service": "gateway",
+  "fault_tolerance": { "max_retries": 2, "unavailable_ttl": 60 },
   "cache": { "hits": 0, "misses": 0, "bypassed": 0, "ratio": "n/a" },
   "pools": {
-    "user":       { "replicas": 3, "requests": 0 },
-    "enterprise": { "replicas": 3, "requests": 0 }
+    "user": {
+      "replicas": [
+        { "host": "user_management_service_1", "port": 8001, "status": "healthy", "available_in_seconds": 0, "total_failures": 0 },
+        { "host": "user_management_service_2", "port": 8001, "status": "healthy", "available_in_seconds": 0, "total_failures": 0 },
+        { "host": "user_management_service_3", "port": 8001, "status": "healthy", "available_in_seconds": 0, "total_failures": 0 }
+      ]
+    },
+    "enterprise": {
+      "replicas": [
+        { "host": "enterprise_management_service_1", "port": 8002, "status": "healthy", "available_in_seconds": 0, "total_failures": 0 },
+        { "host": "enterprise_management_service_2", "port": 8002, "status": "healthy", "available_in_seconds": 0, "total_failures": 0 },
+        { "host": "enterprise_management_service_3", "port": 8002, "status": "healthy", "available_in_seconds": 0, "total_failures": 0 }
+      ]
+    }
   }
 }
 ```
@@ -246,6 +260,8 @@ All variables are set in `docker-compose.yml`. Key ones:
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | user | `30` | JWT lifetime in minutes |
 | `REDIS_URL` | gateway | `redis://redis:6379` | Redis connection string |
 | `CACHE_TTL` | gateway | `30` | Cache entry lifetime in seconds |
+| `MAX_RETRIES` | gateway | `2` | Extra retry attempts after a replica fails (3 total) |
+| `UNAVAILABLE_TTL` | gateway | `60` | Seconds a failed replica is excluded from rotation |
 | `REPLICA_ID` | user / enterprise | `user-1` … | Human-readable replica identifier |
 | `USER_SERVICE_URL` | enterprise | `http://user_management_service_1:8001` | Base URL for inter-service user profile calls |
 
@@ -546,7 +562,7 @@ Because each replica has a **distinct hostname** in Docker Compose (`user_manage
 
 ### Proxy
 
-The gateway uses `http-proxy` (`node-http-proxy`) with `selfHandleResponse: true`, which means it intercepts the upstream response body, stores it in Redis if applicable, and then forwards it to the client. This is what enables transparent caching without the upstream services knowing anything about it.
+The gateway uses Node's built-in **`http.request`** (no external proxy library) to forward each request. The entire request body is buffered in memory first — this allows it to be **replayed on retry** if the first replica fails without the client needing to resend anything.
 
 ### Gateway `/status` response
 
@@ -554,6 +570,10 @@ The gateway uses `http-proxy` (`node-http-proxy`) with `selfHandleResponse: true
 {
   "status": "ok",
   "service": "gateway",
+  "fault_tolerance": {
+    "max_retries": 2,
+    "unavailable_ttl": 60
+  },
   "cache": {
     "redis_url": "redis://redis:6379",
     "ttl_seconds": 30,
@@ -563,14 +583,21 @@ The gateway uses `http-proxy` (`node-http-proxy`) with `selfHandleResponse: true
     "ratio": "84.0% hit rate"
   },
   "pools": {
-    "user":       { "replicas": 3, "requests": 1 },
-    "enterprise": { "replicas": 3, "requests": 0 }
+    "user": {
+      "replicas": [
+        { "host": "user_management_service_1", "port": 8001, "status": "healthy",     "available_in_seconds": 0,  "total_failures": 0 },
+        { "host": "user_management_service_2", "port": 8001, "status": "unavailable", "available_in_seconds": 47, "total_failures": 1 },
+        { "host": "user_management_service_3", "port": 8001, "status": "healthy",     "available_in_seconds": 0,  "total_failures": 0 }
+      ]
+    }
   }
 }
 ```
 
-- `requests` is the **current counter value** (0–2), not the total number of requests.
-- `bypassed` counts `POST`/`PUT`/`DELETE` requests that skipped the cache entirely.
+- `status: "unavailable"` — this replica is excluded from round-robin rotation.
+- `available_in_seconds` — countdown to when it will be automatically re-admitted.
+- `total_failures` — cumulative failure count since startup.
+- `bypassed` in cache — counts `POST`/`PUT`/`DELETE` requests that skipped the cache entirely.
 
 ---
 
@@ -669,7 +696,98 @@ These headers let you instantly see in Postman or curl whether a cached response
 
 ---
 
-## 11. Complete Demo Walk-through
+## 11. Fault Tolerance & Circuit Breaker
+
+### Why fault tolerance is needed
+
+In a replicated setup, individual containers can crash, run out of memory, or become unreachable at any time. Without fault tolerance, a single dead replica would cause **1-in-3 requests to fail** — the client would see a raw `502 Bad Gateway` and would need to retry manually.
+
+The gateway implements an **automatic retry + circuit-breaker** pattern so that replica failures are invisible to the client.
+
+### How it works — step by step
+
+```
+Incoming request
+       │
+       ▼
+ Pick next target (round-robin, skip unavailable)
+       │
+       ▼
+ Forward request → timeout 5 000 ms
+       │
+  ┌────┴────┐
+  │ Success?│
+  └────┬────┘
+       │
+  YES ──────────────────────────────► Return response to client ✅
+       │
+  NO (network error / timeout)
+       │
+       ▼
+ Log: [circuit] attempt N/3 FAILED – hostname: <error>
+ Mark that replica UNAVAILABLE for 60 s
+       │
+       ▼
+ attempts < 3?
+       │
+  YES ──► Pick NEXT available target → retry
+       │
+  NO
+       ▼
+ Return 502 / 503 to client ❌
+```
+
+**Key properties:**
+- Each attempt picks the **next available replica** via round-robin — so retries always land on a *different* container, not the broken one again.
+- A replica is marked unavailable the **moment it fails** — subsequent requests within the 60 s window skip it entirely without even attempting a connection.
+- After 60 s the cooldown expires and the replica is **automatically re-admitted** on the next request — no manual intervention needed.
+- If **all 3 replicas** are simultaneously unavailable, the gateway returns `503 Service Temporarily Unavailable` immediately.
+
+### Configuration
+
+```yaml
+# docker-compose.yml — gateway environment
+MAX_RETRIES: "2"        # extra attempts after 1st failure  →  3 total per request
+UNAVAILABLE_TTL: "60"   # seconds a failed replica is excluded from rotation
+```
+
+### What the gateway logs during a failure
+
+```
+[gateway] attempt 1/3  GET /whoami → user_management_service_1:8001
+[circuit] attempt 1/3 FAILED – user_management_service_1:8001: getaddrinfo ENOTFOUND
+[circuit] OPEN  user_management_service_1:8001 – excluded for 60s (until 2026-02-21T14:46:07Z)
+[gateway] attempt 2/3  GET /whoami → user_management_service_2:8001
+                                      ↑ transparently retried on replica 2, client sees 200 OK
+```
+
+### What /status shows while a replica is down
+
+```json
+{
+  "pools": {
+    "user": {
+      "replicas": [
+        { "host": "user_management_service_1", "status": "unavailable", "available_in_seconds": 47, "total_failures": 1 },
+        { "host": "user_management_service_2", "status": "healthy",     "available_in_seconds": 0,  "total_failures": 0 },
+        { "host": "user_management_service_3", "status": "healthy",     "available_in_seconds": 0,  "total_failures": 0 }
+      ]
+    }
+  }
+}
+```
+
+### Recovery log
+
+When the 60 s cooldown expires and the replica receives its first successful request:
+
+```
+[circuit] RECOVERED  user_management_service_1:8001 – back in rotation
+```
+
+---
+
+## 12. Complete Demo Walk-through
 
 This section walks through a complete end-to-end story for demonstrating all features. All requests go through the gateway at `http://localhost:8000`.
 
@@ -915,161 +1033,228 @@ curl -s http://localhost:8000/api/enterprise/enterprise/1/roles
 
 ---
 
-## 12. Proving Round-Robin & Cache in Action
+---
 
-### Proving Round-Robin
+## 13. Proving Round-Robin, Cache & Fault Tolerance in Postman
 
-The `/whoami` endpoint on both services returns the `replica_id` and `hostname` of the specific container that handled the request. Hit it multiple times and watch the responses rotate:
+All three demonstrations below use only **Postman** and the **Docker Desktop / terminal**. No Python or curl required.
 
-**User service pool:**
+---
+
+### 🔄 Demo A — Round-Robin Load Balancing
+
+The `/whoami` endpoint is **never cached** (it is on the no-cache list) so every request hits a live replica.
+
+#### Setup in Postman
+
+1. Create a new request:
+   - **Method:** `GET`
+   - **URL:** `http://localhost:8000/api/users/whoami`
+2. Do **not** add any headers or body.
+
+#### Steps
+
+| Step | Action | What to look for |
+|---|---|---|
+| 1 | Send the request | Response body shows `"replica_id": "user-1"` and `"hostname": "user_management_service_1"` |
+| 2 | Send again | `"replica_id": "user-2"` — different container |
+| 3 | Send again | `"replica_id": "user-3"` — third container |
+| 4 | Send again | `"replica_id": "user-1"` — cycle restarts |
+
+**Expected response body (rotates each time):**
+```json
+{
+  "service": "user_management_service",
+  "replica_id": "user-1",
+  "hostname": "user_management_service_1"
+}
+```
+
+Repeat the same test for the enterprise pool:
+- **URL:** `http://localhost:8000/api/enterprise/whoami`
+- You will see `enterprise-1` → `enterprise-2` → `enterprise-3` → `enterprise-1` …
+
+#### Confirm via gateway logs
+
+In a terminal, run:
 ```bash
-python3 -c "
-import urllib.request, json
-for i in range(6):
-    r = urllib.request.urlopen('http://localhost:8000/api/users/whoami')
-    d = json.loads(r.read())
-    print(f'Request {i+1}: replica_id={d[\"replica_id\"]}  hostname={d[\"hostname\"]}')
-"
+docker logs -f gateway 2>&1 | grep "\[gateway\] attempt"
 ```
 
-**Expected output — the replica rotates 1 → 2 → 3 → 1 → 2 → 3:**
+You will see the pool slot cycling on every request:
 ```
-Request 1: replica_id=user-1  hostname=user_management_service_1
-Request 2: replica_id=user-2  hostname=user_management_service_2
-Request 3: replica_id=user-3  hostname=user_management_service_3
-Request 4: replica_id=user-1  hostname=user_management_service_1
-Request 5: replica_id=user-2  hostname=user_management_service_2
-Request 6: replica_id=user-3  hostname=user_management_service_3
-```
-
-**Enterprise service pool:**
-```bash
-python3 -c "
-import urllib.request, json
-for i in range(6):
-    r = urllib.request.urlopen('http://localhost:8000/api/enterprise/whoami')
-    d = json.loads(r.read())
-    print(f'Request {i+1}: replica_id={d[\"replica_id\"]}  hostname={d[\"hostname\"]}')
-"
-```
-
-You can also watch the gateway logs in real-time to see the `pool[0]` → `pool[1]` → `pool[2]` rotation on every request:
-
-```bash
-docker logs -f gateway 2>&1 | grep "\[gateway\]"
-```
-
-```
-[gateway] GET /api/users/whoami → http://user_management_service_1:8001/whoami  (pool[0])
-[gateway] GET /api/users/whoami → http://user_management_service_2:8001/whoami  (pool[1])
-[gateway] GET /api/users/whoami → http://user_management_service_3:8001/whoami  (pool[2])
-[gateway] GET /api/users/whoami → http://user_management_service_1:8001/whoami  (pool[0])
+[gateway] attempt 1/3  GET /whoami → user_management_service_1:8001
+[gateway] attempt 1/3  GET /whoami → user_management_service_2:8001
+[gateway] attempt 1/3  GET /whoami → user_management_service_3:8001
+[gateway] attempt 1/3  GET /whoami → user_management_service_1:8001
 ```
 
 ---
 
-### Proving Redis Cache
+### 💾 Demo B — Redis Cache (HIT vs MISS)
 
-#### Method 1 — Response headers (Postman / curl)
+#### Setup in Postman
 
-Make the same GET request twice and observe the `X-Cache` header:
+1. Create a new request:
+   - **Method:** `GET`
+   - **URL:** `http://localhost:8000/api/users/user/1`
+2. Go to the **Headers** tab in the response panel after sending.
 
-```bash
-# First request — MISS (hits upstream, stores in Redis)
-python3 -c "
-import urllib.request, json
-req = urllib.request.Request('http://localhost:8000/api/users/user/1')
-with urllib.request.urlopen(req) as r:
-    print('X-Cache:', r.headers.get('X-Cache'))
-    print('Response time: check gateway logs')
-    print(json.dumps(json.loads(r.read()), indent=2))
-"
+#### Steps
 
-# Second request — HIT (served from Redis, upstream never called)
-python3 -c "
-import urllib.request, json
-req = urllib.request.Request('http://localhost:8000/api/users/user/1')
-with urllib.request.urlopen(req) as r:
-    print('X-Cache:', r.headers.get('X-Cache'))
-"
-```
+| Step | Action | `X-Cache` header | Response time |
+|---|---|---|---|
+| 1 | Send `GET /api/users/user/1` | `MISS` | ~15–25 ms (hits FastAPI + Postgres) |
+| 2 | Send the same request again | `HIT` | ~1–3 ms (served from Redis) |
+| 3 | Send again (within 30 s) | `HIT` | ~1–3 ms |
+| 4 | Wait 30 s, then send | `MISS` | ~15–25 ms (TTL expired, cache refreshed) |
 
-Output:
-```
-# Request 1:
-X-Cache: MISS
+> 💡 **Tip:** In Postman, the response time is shown in the bottom-right corner of the response panel. The jump from ~20 ms → ~2 ms is the clearest proof of caching.
 
-# Request 2:
-X-Cache: HIT
-```
+Also check the `X-Cache-TTL: 30` header — it shows the configured TTL in seconds.
 
-#### Method 2 — Gateway logs
+#### Confirm cache is bypassed for POST
+
+1. Create a new request:
+   - **Method:** `POST`
+   - **URL:** `http://localhost:8000/api/users/login`
+   - **Body (JSON):** `{"username": "john_doe", "password": "secret123"}`
+2. Send it multiple times.
+3. Each time, check the response **Headers** tab — there is **no `X-Cache` header** at all, confirming POST requests bypass the cache entirely.
+
+#### Inspect Redis directly (optional)
 
 ```bash
-docker logs -f gateway 2>&1 | grep -E "\[cache\]"
-```
-
-```
-[cache] MISS gw:/api/users/user/1          ← first request
-[cache] SET  gw:/api/users/user/1  (TTL 30s)  ← stored in Redis
-[cache] HIT  gw:/api/users/user/1          ← second request, NOT forwarded to upstream
-[cache] HIT  gw:/api/users/user/1          ← third request, still cached
-```
-
-Notice: when a cache HIT occurs, you will **not** see a `[gateway]` proxy log line — the request never reached the upstream service.
-
-#### Method 3 — Cache stats on /status
-
-```bash
-python3 -c "
-import urllib.request, json
-r = urllib.request.urlopen('http://localhost:8000/status')
-d = json.loads(r.read())
-print(json.dumps(d['cache'], indent=2))
-"
-```
-
-```json
-{
-  "redis_url": "redis://redis:6379",
-  "ttl_seconds": 30,
-  "hits": 5,
-  "misses": 2,
-  "bypassed": 3,
-  "ratio": "71.4% hit rate"
-}
-```
-
-- `hits` — requests served from Redis (no upstream call)
-- `misses` — requests that hit upstream (first time or after TTL expired)
-- `bypassed` — `POST`/`PUT`/`DELETE` requests that skipped cache entirely
-
-#### Method 4 — Inspect Redis directly
-
-```bash
-# Connect to the Redis CLI inside the container
 docker exec -it redis redis-cli
 
 # List all cached keys
 KEYS gw:*
 
-# See what's stored for a specific key
-GET gw:/api/users/user/1
-
-# Check the remaining TTL for a key (in seconds)
+# See the remaining TTL of a specific key
 TTL gw:/api/users/user/1
 
-# Manually flush all cache entries (forces all next requests to MISS)
+# Force all future requests to be MISSes
 FLUSHALL
 ```
 
-#### Method 5 — Verify cache bypasses mutations
+#### Confirm via /status
 
-```bash
-# POST /login — should be BYPASSED (not cached)
-curl -s -X POST http://localhost:8000/api/users/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"john_doe","password":"secret123"}'
+Send `GET http://localhost:8000/status` and look at the `cache` object:
+```json
+"cache": {
+  "hits": 3,
+  "misses": 1,
+  "bypassed": 2,
+  "ratio": "75.0% hit rate"
+}
 ```
 
-Then check the gateway logs — you'll see `[gateway] POST …` but no `[cache]` line, confirming POST requests are always forwarded directly to upstream without touching Redis.
+---
+
+### 🔌 Demo C — Fault Tolerance & Circuit Breaker
+
+This demo shows that killing a replica is **transparent to the client** — requests are retried on a healthy replica automatically.
+
+#### Setup
+
+You need two windows open simultaneously:
+- **Window 1:** Postman
+- **Window 2:** A terminal
+
+#### Step 1 — Verify all replicas are healthy
+
+In Postman, send:
+- **Method:** `GET`
+- **URL:** `http://localhost:8000/status`
+
+In the response, confirm all replicas show `"status": "healthy"`:
+```json
+"replicas": [
+  { "host": "user_management_service_1", "status": "healthy", "total_failures": 0 },
+  { "host": "user_management_service_2", "status": "healthy", "total_failures": 0 },
+  { "host": "user_management_service_3", "status": "healthy", "total_failures": 0 }
+]
+```
+
+#### Step 2 — Kill one replica
+
+In the terminal:
+```bash
+docker stop user_management_service_1
+```
+
+#### Step 3 — Send requests immediately after the kill
+
+In Postman, send `GET http://localhost:8000/api/users/whoami` several times.
+
+**What you observe:**
+- Every response is still `200 OK` ✅
+- The `replica_id` field **never shows `user-1`** — it rotates only between `user-2` and `user-3`
+- Response time on the first request after the kill may be slightly higher (the gateway waited for the 5 s timeout before retrying on a healthy replica)
+
+#### Step 4 — Confirm the circuit is open via /status
+
+In Postman, send `GET http://localhost:8000/status`:
+
+```json
+"replicas": [
+  { "host": "user_management_service_1", "status": "unavailable", "available_in_seconds": 54, "total_failures": 1 },
+  { "host": "user_management_service_2", "status": "healthy",     "available_in_seconds": 0,  "total_failures": 0 },
+  { "host": "user_management_service_3", "status": "healthy",     "available_in_seconds": 0,  "total_failures": 0 }
+]
+```
+
+- `available_in_seconds` counts down in real time — refresh `/status` every few seconds to watch it decrease.
+
+#### Step 5 — Watch the gateway logs
+
+```bash
+docker logs -f gateway 2>&1 | grep -E "\[circuit\]|\[gateway\] attempt"
+```
+
+```
+[gateway] attempt 1/3  GET /whoami → user_management_service_1:8001
+[circuit] attempt 1/3 FAILED – user_management_service_1:8001: getaddrinfo ENOTFOUND
+[circuit] OPEN  user_management_service_1:8001 – excluded for 60s (until …)
+[gateway] attempt 2/3  GET /whoami → user_management_service_2:8001
+[gateway] attempt 1/3  GET /whoami → user_management_service_3:8001   ← already skips replica 1
+[gateway] attempt 1/3  GET /whoami → user_management_service_2:8001
+```
+
+After the first failure, notice all subsequent requests show `attempt 1/3` going straight to replica 2 or 3 — replica 1 is being skipped without even attempting a connection.
+
+#### Step 6 — Restore the replica and watch auto-recovery
+
+In the terminal:
+```bash
+docker start user_management_service_1
+```
+
+Wait ~60 seconds (the `UNAVAILABLE_TTL`), then send `GET /api/users/whoami` in Postman again. You will see `replica_id: user-1` appear in responses again.
+
+In the gateway logs:
+```
+[circuit] RECOVERED  user_management_service_1:8001 – back in rotation
+```
+
+And `/status` will show all three replicas as `"healthy"` again.
+
+#### Step 7 — Kill all 3 replicas (edge case)
+
+```bash
+docker stop user_management_service_1 user_management_service_2 user_management_service_3
+```
+
+Send any request in Postman. You will receive:
+```json
+{
+  "detail": "Service temporarily unavailable – all replicas are down"
+}
+```
+With HTTP status `503 Service Unavailable`.
+
+Restore with:
+```bash
+docker start user_management_service_1 user_management_service_2 user_management_service_3
+```
+

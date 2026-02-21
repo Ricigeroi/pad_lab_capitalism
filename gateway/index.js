@@ -1,124 +1,228 @@
 'use strict';
 
-const http = require('http');
-const httpProxy = require('http-proxy');
+const http    = require('http');
 const express = require('express');
-const morgan = require('morgan');
-const Redis = require('ioredis');
+const morgan  = require('morgan');
+const Redis   = require('ioredis');
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const PORT       = process.env.PORT       || 8000;
-const REDIS_URL  = process.env.REDIS_URL  || 'redis://redis:6379';
-const CACHE_TTL  = parseInt(process.env.CACHE_TTL || '30', 10); // seconds
+const PORT              = parseInt(process.env.PORT       || '8000', 10);
+const REDIS_URL         = process.env.REDIS_URL           || 'redis://redis:6379';
+const CACHE_TTL         = parseInt(process.env.CACHE_TTL  || '30',   10); // seconds
+const MAX_RETRIES       = parseInt(process.env.MAX_RETRIES || '2',   10); // extra attempts after 1st failure
+const UNAVAILABLE_TTL   = parseInt(process.env.UNAVAILABLE_TTL || '60', 10); // seconds a failed replica is excluded
 
 // ── Redis client ──────────────────────────────────────────────────────────────
 const redis = new Redis(REDIS_URL, { lazyConnect: true });
-
-redis.on('connect',  () => console.log('[gateway] Redis connected'));
-redis.on('error',    (e) => console.error(`[gateway] Redis error: ${e.message}`));
-
+redis.on('connect', () => console.log('[gateway] Redis connected'));
+redis.on('error',   (e) => console.error(`[gateway] Redis error: ${e.message}`));
 redis.connect().catch((e) => console.error(`[gateway] Redis initial connect failed: ${e.message}`));
 
 // ── Cache stats ───────────────────────────────────────────────────────────────
 const cacheStats = { hits: 0, misses: 0, bypassed: 0 };
 
 // ── Target pools ──────────────────────────────────────────────────────────────
-// Docker Compose replicas are reachable via the service name as the hostname.
-// With `deploy.replicas: 3`, Docker's internal DNS returns all 3 task IPs when
-// the service name is resolved, but to implement explicit round-robin here we
-// list the tasks by their Compose-assigned hostnames (tasks.<service>.<index>
-// are not guaranteed; Docker Swarm uses them but plain Compose does not).
-//
-// For plain `docker compose up --scale`, replicas share one DNS name and Docker
-// load-balances at the network level. We still implement our own round-robin on
-// top by tracking a counter per pool – this gives us visible, deterministic
-// balancing and lets us add health-aware skipping later.
-//
-// The hostnames below match the service names declared in docker-compose.yml.
-// Each replica is identical, so we point all slots at the same hostname and let
-// our counter cycle through them – in practice Docker will map each connection
-// to a different container via its internal IPVS load-balancer.
-//
-// If you switch to Docker Swarm, replace the entries with:
-//   "tasks.user_management_service" (resolves to all task IPs via DNS round-robin)
-
+// Each target carries its own health state:
+//   unavailableUntil = 0          → healthy (in rotation)
+//   unavailableUntil = <timestamp> → excluded until that epoch-ms passes
 const POOLS = {
   user: {
     targets: [
-      { host: 'user_management_service_1', port: 8001 },
-      { host: 'user_management_service_2', port: 8001 },
-      { host: 'user_management_service_3', port: 8001 },
+      { host: 'user_management_service_1', port: 8001, unavailableUntil: 0, failures: 0 },
+      { host: 'user_management_service_2', port: 8001, unavailableUntil: 0, failures: 0 },
+      { host: 'user_management_service_3', port: 8001, unavailableUntil: 0, failures: 0 },
     ],
     counter: 0,
   },
   enterprise: {
     targets: [
-      { host: 'enterprise_management_service_1', port: 8002 },
-      { host: 'enterprise_management_service_2', port: 8002 },
-      { host: 'enterprise_management_service_3', port: 8002 },
+      { host: 'enterprise_management_service_1', port: 8002, unavailableUntil: 0, failures: 0 },
+      { host: 'enterprise_management_service_2', port: 8002, unavailableUntil: 0, failures: 0 },
+      { host: 'enterprise_management_service_3', port: 8002, unavailableUntil: 0, failures: 0 },
     ],
     counter: 0,
   },
 };
 
-// ── Round-robin picker ────────────────────────────────────────────────────────
-function nextTarget(pool) {
-  const target = pool.targets[pool.counter % pool.targets.length];
-  pool.counter = (pool.counter + 1) % pool.targets.length;
-  return target;
+// ── Health helpers ────────────────────────────────────────────────────────────
+function isAvailable(target) {
+  if (target.unavailableUntil === 0) return true;
+  if (Date.now() >= target.unavailableUntil) {
+    // cooldown expired – bring back into rotation
+    target.unavailableUntil = 0;
+    target.failures = 0;
+    console.log(`[circuit] RECOVERED  ${target.host}:${target.port} – back in rotation`);
+    return true;
+  }
+  return false;
 }
 
-// ── Proxy ─────────────────────────────────────────────────────────────────────
-const proxy = httpProxy.createProxyServer({ changeOrigin: true, selfHandleResponse: true });
+function markUnavailable(target) {
+  target.unavailableUntil = Date.now() + UNAVAILABLE_TTL * 1000;
+  target.failures++;
+  const until = new Date(target.unavailableUntil).toISOString();
+  console.warn(`[circuit] OPEN  ${target.host}:${target.port} – excluded for ${UNAVAILABLE_TTL}s (until ${until})`);
+}
 
-proxy.on('error', (err, req, res) => {
-  console.error(`[gateway] proxy error: ${err.message}`);
+// ── Round-robin picker (skips unavailable targets) ────────────────────────────
+// Returns the next available target, or null if the entire pool is down.
+function nextTarget(pool) {
+  const total = pool.targets.length;
+  for (let i = 0; i < total; i++) {
+    const candidate = pool.targets[pool.counter % total];
+    pool.counter = (pool.counter + 1) % total;
+    if (isAvailable(candidate)) return candidate;
+  }
+  return null; // all replicas unavailable
+}
+
+// ── Low-level HTTP forwarder (promise-based, no http-proxy dependency) ────────
+function forwardRequest(target, req, bodyBuffer) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: target.host,
+      port:     target.port,
+      path:     req._upstreamPath,
+      method:   req.method,
+      headers:  { ...req.headers, host: `${target.host}:${target.port}` },
+      timeout:  5000,
+    };
+
+    const proxyReq = http.request(options, (proxyRes) => {
+      const chunks = [];
+      proxyRes.on('data', (c) => chunks.push(c));
+      proxyRes.on('end',  () => resolve({ proxyRes, body: Buffer.concat(chunks) }));
+    });
+
+    proxyReq.on('timeout', () => {
+      proxyReq.destroy();
+      reject(new Error(`timeout after 5000ms`));
+    });
+    proxyReq.on('error', reject);
+
+    if (bodyBuffer && bodyBuffer.length) proxyReq.write(bodyBuffer);
+    proxyReq.end();
+  });
+}
+
+// ── Body reader (buffers the incoming request body once) ──────────────────────
+function readBody(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end',  () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+// ── Core dispatch: retry + circuit-breaker ────────────────────────────────────
+async function dispatch(pool, req, res, upstreamPrefix) {
+  // Build the upstream path once (reused across retries)
+  req._upstreamPath = (upstreamPrefix + req.url).replace(/\/+/g, '/') || '/';
+
+  // Buffer the request body so it can be replayed on retries
+  const bodyBuffer = await readBody(req);
+
+  const maxAttempts = MAX_RETRIES + 1; // e.g. 3 total: 1 original + 2 retries
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const target = nextTarget(pool);
+
+    if (!target) {
+      console.error('[circuit] ALL replicas unavailable – returning 503');
+      if (!res.headersSent) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          detail: 'Service temporarily unavailable – all replicas are down',
+        }));
+      }
+      return;
+    }
+
+    console.log(
+      `[gateway] attempt ${attempt}/${maxAttempts}  ${req.method} ${req._upstreamPath}` +
+      ` → ${target.host}:${target.port}`
+    );
+
+    try {
+      const { proxyRes, body } = await forwardRequest(target, req, bodyBuffer);
+
+      // ── Success path ──────────────────────────────────────────────────────
+      // Cache the response if applicable
+      if (req.method === 'GET' && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300 && req._cacheKey) {
+        try {
+          const payload = JSON.stringify({
+            status:  proxyRes.statusCode,
+            headers: proxyRes.headers,
+            body:    body.toString('utf8'),
+          });
+          await redis.set(req._cacheKey, payload, 'EX', CACHE_TTL);
+          console.log(`[cache] SET  ${req._cacheKey}  (TTL ${CACHE_TTL}s)`);
+        } catch (e) {
+          console.error(`[cache] SET error: ${e.message}`);
+        }
+      }
+
+      if (!res.headersSent) {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        res.end(body);
+      }
+      return; // done
+
+    } catch (err) {
+      lastError = err;
+      console.warn(
+        `[circuit] attempt ${attempt}/${maxAttempts} FAILED` +
+        ` – ${target.host}:${target.port}: ${err.message}`
+      );
+
+      // Mark the target unavailable only after it has exhausted all retries
+      // that were aimed at it (here each attempt targets a different replica
+      // picked by round-robin, so one failure = mark that replica unavailable)
+      markUnavailable(target);
+    }
+  }
+
+  // All attempts exhausted
+  console.error(`[circuit] all ${maxAttempts} attempts failed. Last error: ${lastError.message}`);
   if (!res.headersSent) {
     res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      detail: `Upstream unreachable after ${maxAttempts} attempts: ${lastError.message}`,
+    }));
   }
-  res.end(JSON.stringify({ detail: 'Bad gateway – upstream unreachable' }));
-});
-
-// Intercept upstream response to buffer body, cache it, then forward to client
-proxy.on('proxyRes', (proxyRes, req, res) => {
-  const chunks = [];
-  proxyRes.on('data', (chunk) => chunks.push(chunk));
-  proxyRes.on('end', async () => {
-    const body = Buffer.concat(chunks);
-    const statusCode = proxyRes.statusCode;
-
-    // Forward status + headers to client
-    res.writeHead(statusCode, proxyRes.headers);
-    res.end(body);
-
-    // Only cache successful GET responses
-    if (req.method === 'GET' && statusCode >= 200 && statusCode < 300 && req._cacheKey) {
-      try {
-        const payload = JSON.stringify({
-          status:  statusCode,
-          headers: proxyRes.headers,
-          body:    body.toString('utf8'),
-        });
-        await redis.set(req._cacheKey, payload, 'EX', CACHE_TTL);
-        console.log(`[cache] SET  ${req._cacheKey}  (TTL ${CACHE_TTL}s)`);
-      } catch (e) {
-        console.error(`[cache] SET error: ${e.message}`);
-      }
-    }
-  });
-});
+}
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(morgan(':method :url :status :res[content-length] - :response-time ms'));
 
 // ── Status endpoint ───────────────────────────────────────────────────────────
+function poolStatus(pool) {
+  const now = Date.now();
+  return {
+    replicas: pool.targets.map(t => ({
+      host:      t.host,
+      port:      t.port,
+      status:    isAvailable(t) ? 'healthy' : 'unavailable',
+      available_in_seconds: t.unavailableUntil > now
+        ? Math.ceil((t.unavailableUntil - now) / 1000)
+        : 0,
+      total_failures: t.failures,
+    })),
+  };
+}
+
 app.get('/status', (_req, res) => {
   res.json({
-    status: 'ok',
+    status:  'ok',
     service: 'gateway',
+    fault_tolerance: {
+      max_retries:      MAX_RETRIES,
+      unavailable_ttl:  UNAVAILABLE_TTL,
+    },
     cache: {
-      redis_url: REDIS_URL,
+      redis_url:   REDIS_URL,
       ttl_seconds: CACHE_TTL,
       ...cacheStats,
       ratio: cacheStats.hits + cacheStats.misses === 0
@@ -126,36 +230,30 @@ app.get('/status', (_req, res) => {
         : `${((cacheStats.hits / (cacheStats.hits + cacheStats.misses)) * 100).toFixed(1)}% hit rate`,
     },
     pools: {
-      user:       { replicas: POOLS.user.targets.length,       requests: POOLS.user.counter },
-      enterprise: { replicas: POOLS.enterprise.targets.length, requests: POOLS.enterprise.counter },
+      user:       poolStatus(POOLS.user),
+      enterprise: poolStatus(POOLS.enterprise),
     },
   });
 });
 
-// ── Cache middleware (GET only) ───────────────────────────────────────────────
-
-// Paths that must NEVER be cached – they exist specifically to show live,
-// per-replica data, so caching them would defeat their purpose entirely.
+// ── Cache middleware ───────────────────────────────────────────────────────────
 const NO_CACHE_SUFFIXES = ['/whoami', '/status'];
 
 async function cacheMiddleware(req, res, next) {
-  // Never cache non-GET requests (mutations must always hit upstream)
   if (req.method !== 'GET') {
     cacheStats.bypassed++;
     return next();
   }
 
-  // Never cache health / identity endpoints
-  const path = req.originalUrl.split('?')[0]; // strip query string for matching
-  const isNoCachePath = NO_CACHE_SUFFIXES.some(suffix => path.endsWith(suffix));
-  if (isNoCachePath) {
+  const path = req.originalUrl.split('?')[0];
+  if (NO_CACHE_SUFFIXES.some(s => path.endsWith(s))) {
     cacheStats.bypassed++;
     console.log(`[cache] BYPASS (no-cache path) ${req.originalUrl}`);
     return next();
   }
 
   const cacheKey = `gw:${req.originalUrl}`;
-  req._cacheKey = cacheKey; // pass key to proxyRes handler for SET
+  req._cacheKey = cacheKey;
 
   try {
     const cached = await redis.get(cacheKey);
@@ -178,49 +276,18 @@ async function cacheMiddleware(req, res, next) {
   next();
 }
 
-// ── Routing rules ─────────────────────────────────────────────────────────────
-// Express strips the mount prefix from req.url before our handler runs, so:
-//   incoming: /api/users/register       → req.url inside handler: /register
-//   incoming: /api/enterprise/1/roles   → req.url inside handler: /1/roles
-//
-// The enterprise service owns the /enterprise/* namespace, so we must
-// re-prepend "/enterprise" to every request routed there.
-// The user service owns routes at the root (/, /register, /login, /user/…),
-// so no rewrite is needed.
+// ── Routing ───────────────────────────────────────────────────────────────────
+app.use('/api/users',      cacheMiddleware, (req, res) => dispatch(POOLS.user,       req, res, ''));
+app.use('/api/enterprise', cacheMiddleware, (req, res) => dispatch(POOLS.enterprise, req, res, '/enterprise'));
 
-function makeRouter(pool, upstreamPrefix, originalPrefix) {
-  return (req, res) => {
-    const target = nextTarget(pool);
-    const upstream = `http://${target.host}:${target.port}`;
-
-    const originalUrl = req.url;
-    req.url = (upstreamPrefix + req.url).replace(/\/+/g, '/') || '/';
-
-    console.log(
-      `[gateway] ${req.method} ${originalPrefix}${originalUrl} → ${upstream}${req.url}  (pool[${(pool.counter === 0 ? pool.targets.length : pool.counter) - 1}])`
-    );
-
-    proxy.web(req, res, { target: upstream });
-  };
-}
-
-// Apply cache middleware then proxy
-// /api/users/**      → user_management_service:8001/**
-// /api/enterprise/** → enterprise_management_service:8002/enterprise/**
-app.use('/api/users',      cacheMiddleware, makeRouter(POOLS.user,       '',            '/api/users'));
-app.use('/api/enterprise', cacheMiddleware, makeRouter(POOLS.enterprise, '/enterprise', '/api/enterprise'));
-
-// Catch-all for unknown routes
-app.use((_req, res) => {
-  res.status(404).json({ detail: 'Route not found on gateway' });
-});
+app.use((_req, res) => res.status(404).json({ detail: 'Route not found on gateway' }));
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const server = http.createServer(app);
-
 server.listen(PORT, () => {
   console.log(`[gateway] listening on port ${PORT}`);
-  console.log(`[gateway] Redis cache       → ${REDIS_URL}  (TTL ${CACHE_TTL}s)`);
-  console.log(`[gateway] user pool         → ${POOLS.user.targets.map(t => t.host).join(', ')}`);
-  console.log(`[gateway] enterprise pool   → ${POOLS.enterprise.targets.map(t => t.host).join(', ')}`);
+  console.log(`[gateway] fault tolerance  → max_retries=${MAX_RETRIES}  unavailable_ttl=${UNAVAILABLE_TTL}s`);
+  console.log(`[gateway] Redis cache      → ${REDIS_URL}  (TTL ${CACHE_TTL}s)`);
+  console.log(`[gateway] user pool        → ${POOLS.user.targets.map(t => t.host).join(', ')}`);
+  console.log(`[gateway] enterprise pool  → ${POOLS.enterprise.targets.map(t => t.host).join(', ')}`);
 });

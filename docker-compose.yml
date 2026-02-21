@@ -181,6 +181,8 @@ services:
       PORT: "8000"
       REDIS_URL: "redis://redis:6379"
       CACHE_TTL: "30"
+      MAX_RETRIES: "2"
+      UNAVAILABLE_TTL: "60"
     ports:
       - "8000:8000"
     depends_on:
