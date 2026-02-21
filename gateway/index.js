@@ -4,6 +4,23 @@ const http = require('http');
 const httpProxy = require('http-proxy');
 const express = require('express');
 const morgan = require('morgan');
+const Redis = require('ioredis');
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const PORT       = process.env.PORT       || 8000;
+const REDIS_URL  = process.env.REDIS_URL  || 'redis://redis:6379';
+const CACHE_TTL  = parseInt(process.env.CACHE_TTL || '30', 10); // seconds
+
+// ── Redis client ──────────────────────────────────────────────────────────────
+const redis = new Redis(REDIS_URL, { lazyConnect: true });
+
+redis.on('connect',  () => console.log('[gateway] Redis connected'));
+redis.on('error',    (e) => console.error(`[gateway] Redis error: ${e.message}`));
+
+redis.connect().catch((e) => console.error(`[gateway] Redis initial connect failed: ${e.message}`));
+
+// ── Cache stats ───────────────────────────────────────────────────────────────
+const cacheStats = { hits: 0, misses: 0, bypassed: 0 };
 
 // ── Target pools ──────────────────────────────────────────────────────────────
 // Docker Compose replicas are reachable via the service name as the hostname.
@@ -52,7 +69,7 @@ function nextTarget(pool) {
 }
 
 // ── Proxy ─────────────────────────────────────────────────────────────────────
-const proxy = httpProxy.createProxyServer({ changeOrigin: true });
+const proxy = httpProxy.createProxyServer({ changeOrigin: true, selfHandleResponse: true });
 
 proxy.on('error', (err, req, res) => {
   console.error(`[gateway] proxy error: ${err.message}`);
@@ -62,21 +79,90 @@ proxy.on('error', (err, req, res) => {
   res.end(JSON.stringify({ detail: 'Bad gateway – upstream unreachable' }));
 });
 
+// Intercept upstream response to buffer body, cache it, then forward to client
+proxy.on('proxyRes', (proxyRes, req, res) => {
+  const chunks = [];
+  proxyRes.on('data', (chunk) => chunks.push(chunk));
+  proxyRes.on('end', async () => {
+    const body = Buffer.concat(chunks);
+    const statusCode = proxyRes.statusCode;
+
+    // Forward status + headers to client
+    res.writeHead(statusCode, proxyRes.headers);
+    res.end(body);
+
+    // Only cache successful GET responses
+    if (req.method === 'GET' && statusCode >= 200 && statusCode < 300 && req._cacheKey) {
+      try {
+        const payload = JSON.stringify({
+          status:  statusCode,
+          headers: proxyRes.headers,
+          body:    body.toString('utf8'),
+        });
+        await redis.set(req._cacheKey, payload, 'EX', CACHE_TTL);
+        console.log(`[cache] SET  ${req._cacheKey}  (TTL ${CACHE_TTL}s)`);
+      } catch (e) {
+        console.error(`[cache] SET error: ${e.message}`);
+      }
+    }
+  });
+});
+
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
-app.use(morgan(':method :url :status :res[content-length] - :response-time ms → :req[x-forwarded-host]'));
+app.use(morgan(':method :url :status :res[content-length] - :response-time ms'));
 
 // ── Status endpoint ───────────────────────────────────────────────────────────
 app.get('/status', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'gateway',
+    cache: {
+      redis_url: REDIS_URL,
+      ttl_seconds: CACHE_TTL,
+      ...cacheStats,
+      ratio: cacheStats.hits + cacheStats.misses === 0
+        ? 'n/a'
+        : `${((cacheStats.hits / (cacheStats.hits + cacheStats.misses)) * 100).toFixed(1)}% hit rate`,
+    },
     pools: {
       user:       { replicas: POOLS.user.targets.length,       requests: POOLS.user.counter },
       enterprise: { replicas: POOLS.enterprise.targets.length, requests: POOLS.enterprise.counter },
     },
   });
 });
+
+// ── Cache middleware (GET only) ───────────────────────────────────────────────
+async function cacheMiddleware(req, res, next) {
+  // Never cache non-GET requests (mutations must always hit upstream)
+  if (req.method !== 'GET') {
+    cacheStats.bypassed++;
+    return next();
+  }
+
+  const cacheKey = `gw:${req.originalUrl}`;
+  req._cacheKey = cacheKey; // pass key to proxyRes handler for SET
+
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      cacheStats.hits++;
+      const { status, headers, body } = JSON.parse(cached);
+      console.log(`[cache] HIT  ${cacheKey}`);
+      res.set(headers);
+      res.set('X-Cache', 'HIT');
+      res.set('X-Cache-TTL', String(CACHE_TTL));
+      return res.status(status).send(body);
+    }
+  } catch (e) {
+    console.error(`[cache] GET error: ${e.message}`);
+  }
+
+  cacheStats.misses++;
+  console.log(`[cache] MISS ${cacheKey}`);
+  res.set('X-Cache', 'MISS');
+  next();
+}
 
 // ── Routing rules ─────────────────────────────────────────────────────────────
 // Express strips the mount prefix from req.url before our handler runs, so:
@@ -93,8 +179,6 @@ function makeRouter(pool, upstreamPrefix, originalPrefix) {
     const target = nextTarget(pool);
     const upstream = `http://${target.host}:${target.port}`;
 
-    // req.url has already been stripped of the mount prefix by Express.
-    // Re-prepend the upstream's own base path when needed.
     const originalUrl = req.url;
     req.url = (upstreamPrefix + req.url).replace(/\/+/g, '/') || '/';
 
@@ -106,10 +190,11 @@ function makeRouter(pool, upstreamPrefix, originalPrefix) {
   };
 }
 
-// /api/users/**      → user_management_service:8001/**         (no prefix needed)
+// Apply cache middleware then proxy
+// /api/users/**      → user_management_service:8001/**
 // /api/enterprise/** → enterprise_management_service:8002/enterprise/**
-app.use('/api/users',      makeRouter(POOLS.user,       '',              '/api/users'));
-app.use('/api/enterprise', makeRouter(POOLS.enterprise, '/enterprise',   '/api/enterprise'));
+app.use('/api/users',      cacheMiddleware, makeRouter(POOLS.user,       '',            '/api/users'));
+app.use('/api/enterprise', cacheMiddleware, makeRouter(POOLS.enterprise, '/enterprise', '/api/enterprise'));
 
 // Catch-all for unknown routes
 app.use((_req, res) => {
@@ -117,11 +202,11 @@ app.use((_req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 8000;
 const server = http.createServer(app);
 
 server.listen(PORT, () => {
   console.log(`[gateway] listening on port ${PORT}`);
-  console.log(`[gateway] user pool        → ${POOLS.user.targets.map(t => t.host).join(', ')}`);
-  console.log(`[gateway] enterprise pool  → ${POOLS.enterprise.targets.map(t => t.host).join(', ')}`);
+  console.log(`[gateway] Redis cache       → ${REDIS_URL}  (TTL ${CACHE_TTL}s)`);
+  console.log(`[gateway] user pool         → ${POOLS.user.targets.map(t => t.host).join(', ')}`);
+  console.log(`[gateway] enterprise pool   → ${POOLS.enterprise.targets.map(t => t.host).join(', ')}`);
 });
