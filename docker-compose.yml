@@ -19,6 +19,25 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── PostgreSQL for enterprise_management_service ────────────────────────────
+  postgres_enterprise:
+    image: postgres:16-alpine
+    container_name: postgres_enterprise
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: capitalism_user
+      POSTGRES_PASSWORD: capitalism_pass
+      POSTGRES_DB: enterprise_management_db
+    volumes:
+      - pg_enterprise_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"          # host:5434 → container:5432 (avoids clash with local PG)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U capitalism_user -d enterprise_management_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # ── User Management Service ─────────────────────────────────────────────────
   user_management_service:
     build:
@@ -37,17 +56,32 @@ services:
       postgres_user_mgmt:
         condition: service_healthy
 
-  # ── Enterprise Management Service (placeholder) ─────────────────────────────
+  # ── Enterprise Management Service ───────────────────────────────────────────
   enterprise_management_service:
     build:
       context: ./enterprise_management_service
       dockerfile: Dockerfile
     container_name: enterprise_management_service
     restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://capitalism_user:capitalism_pass@postgres_enterprise:5432/enterprise_management_db
+      SECRET_KEY: changeme_use_a_long_random_string_in_production
+      ALGORITHM: HS256
     ports:
       - "8002:8002"
-    profiles:
-      - enterprise   # only starts when explicitly enabled: docker compose --profile enterprise up
+    depends_on:
+      postgres_enterprise:
+        condition: service_healthy
 
+  pgadmin:
+    image: dpage/pgadmin4
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres_user_mgmt
 volumes:
   pg_user_mgmt_data:
+  pg_enterprise_data:
